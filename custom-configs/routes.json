@@ -1,0 +1,10 @@
+{
+  "default": "dashscope,qwen-plus",
+  "background": "llamacpp-local,gpt-oss-20b-GGUF-q5_k_m",
+  "coding": "dashscope,qwen3-coder-plus",
+  "thinking": "ollama-local,deepseek-v3.1:671b-cloud",
+  "longContext": "dashscope,qwen3-coder-plus",
+  "longContextThreshold": 60000,
+  "image": "dashscope,qwen3-vl-plus",
+  "description": "Routing rules for different task types - modify via ccr-smart-config script"
+}

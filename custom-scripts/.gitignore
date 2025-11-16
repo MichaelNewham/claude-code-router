@@ -1,0 +1,13 @@
+# Ignore files with sensitive data
+*.key
+*.secret
+.env
+config.json
+
+# Ignore backup files
+*.backup.*
+*~
+
+# Ignore logs
+*.log
+logs/

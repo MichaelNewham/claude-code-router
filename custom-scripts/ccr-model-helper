@@ -1,0 +1,107 @@
+#!/bin/bash
+#
+# ccr-model-helper - Wrapper for ccr model with better exit handling
+#
+# This wrapper helps with SSH tunnel issues where CTRL+C exits the tunnel
+#
+
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+echo -e "${CYAN}    CCR Model Configuration Helper${NC}"
+echo -e "${CYAN}═══════════════════════════════════════════════${NC}"
+echo ""
+echo -e "${YELLOW}NOTE: If you're connected via SSH:${NC}"
+echo "  • To exit interactive prompts: Press ESC or CTRL+D"
+echo "  • CTRL+C may disconnect your SSH session"
+echo "  • If stuck: Open another terminal and run 'pkill -f ccr'"
+echo ""
+echo -e "${CYAN}Options:${NC}"
+echo "  1) Launch ccr model (interactive)"
+echo "  2) View current configuration only"
+echo "  3) Edit routes.json manually"
+echo "  4) Run ccr-smart-config instead"
+echo "  q) Exit"
+echo ""
+
+read -p "Choose option [1-4, q to quit]: " option
+
+# Handle exit inputs
+if [[ "$option" == "q" ]] || [[ "$option" == "Q" ]] || [[ "$option" == "exit" ]] || [[ -z "$option" ]]; then
+    echo "Exiting"
+    exit 0
+fi
+
+case $option in
+    1)
+        echo ""
+        echo -e "${GREEN}Launching ccr model...${NC}"
+        echo -e "${YELLOW}Remember: ESC or CTRL+D to exit${NC}"
+        echo ""
+        sleep 1
+
+        # Run ccr model, catch any errors
+        if ! /usr/bin/ccr model; then
+            echo ""
+            echo -e "${YELLOW}Exited from ccr model${NC}"
+        fi
+        ;;
+
+    2)
+        echo ""
+        echo -e "${GREEN}Current CCR Configuration:${NC}"
+        echo ""
+
+        if [ -f ~/.claude-code-router/routes.json ]; then
+            cat ~/.claude-code-router/routes.json | python3 -m json.tool
+        else
+            echo "No configuration found"
+        fi
+
+        echo ""
+        echo "Config file: ~/.claude-code-router/routes.json"
+        ;;
+
+    3)
+        echo ""
+        echo -e "${GREEN}Opening routes.json in nano...${NC}"
+        echo "Save: CTRL+O, Enter | Exit: CTRL+X"
+        echo ""
+        sleep 1
+
+        nano ~/.claude-code-router/routes.json
+
+        echo ""
+        echo -e "${YELLOW}Regenerating CCR configuration...${NC}"
+        /root/scripts/ccr-regenerate-config.sh
+
+        echo ""
+        read -p "Restart CCR now? [y/N]: " restart
+        if [[ "$restart" == "y" ]] || [[ "$restart" == "Y" ]]; then
+            ccr restart
+            echo -e "${GREEN}✓ CCR restarted${NC}"
+        else
+            echo "Remember to restart CCR: ccr restart"
+        fi
+        ;;
+
+    4)
+        echo ""
+        echo -e "${GREEN}Launching ccr-smart-config...${NC}"
+        echo ""
+        /root/scripts/ccr-smart-config
+        ;;
+
+    *)
+        echo -e "${YELLOW}Invalid option${NC}"
+        exit 1
+        ;;
+esac
+
+echo ""

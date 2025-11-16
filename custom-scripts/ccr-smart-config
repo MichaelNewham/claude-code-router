@@ -1,0 +1,385 @@
+#!/bin/bash
+#
+# ccr-smart-config - Dynamic CCR configuration with auto-discovered models
+#
+# Discovers available local (llama.cpp), Ollama cloud, and DashScope models
+# and provides an interactive interface to configure CCR routing rules.
+#
+
+set -e
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+ROUTES_FILE="$HOME/.claude-code-router/routes.json"
+
+# Function to get task type labels for a model
+get_task_labels() {
+    local model="$1"
+    local labels=""
+
+    # Convert to lowercase for case-insensitive matching
+    local model_lower=$(echo "$model" | tr '[:upper:]' '[:lower:]')
+
+    # Vision/Image models
+    if [[ $model_lower =~ vl|vision|minicpm-v|glm ]]; then
+        labels="${labels}image,"
+    fi
+
+    # Coding models
+    if [[ $model_lower =~ coder|code|granite ]]; then
+        labels="${labels}coding,"
+    fi
+
+    # Thinking/Reasoning models
+    if [[ $model_lower =~ thinking|deepseek|reasoning|o1 ]]; then
+        labels="${labels}thinking,"
+    fi
+
+    # Long context models (>100k context)
+    if [[ $model_lower =~ qwen3-coder|qwen.*coder|kimi|gemini|claude|gpt-4 ]] || \
+       [[ $model_lower =~ longcontext|long-context|1m|200k|128k ]]; then
+        labels="${labels}longContext,"
+    fi
+
+    # Background/Fast models (smaller, efficient)
+    if [[ $model_lower =~ turbo|flash|mini|small|7b|8b|14b ]] && \
+       [[ ! $model_lower =~ thinking|reasoning ]]; then
+        labels="${labels}background,"
+    fi
+
+    # Default (general purpose) - if no specific label or multi-purpose
+    if [[ -z "$labels" ]] || \
+       [[ $model_lower =~ plus|max|gpt-oss|mixtral|qwen3-max|gemini.*pro ]]; then
+        labels="${labels}default,"
+    fi
+
+    # Remove trailing comma
+    labels="${labels%,}"
+
+    echo "$labels"
+}
+
+# Function to get DashScope pricing
+get_dashscope_price() {
+    local model="$1"
+    local price=""
+
+    case "$model" in
+        qwen-turbo*) price="~\$0.30/1M" ;;
+        qwen-plus*) price="~\$0.60/1M" ;;
+        qwen-max*) price="~\$2.50/1M" ;;
+        qwen3-max*) price="~\$2.50/1M" ;;
+        qwen-coder-plus*|qwen3-coder-plus*) price="~\$0.60/1M" ;;
+        qwen3-coder-flash*) price="~\$0.30/1M" ;;
+        qwen-vl-plus*|qwen3-vl-plus*) price="~\$1.00/1M" ;;
+        qwen-vl-max*) price="~\$2.50/1M" ;;
+        qwen3-vl-flash*) price="~\$0.50/1M" ;;
+        *) price="" ;;
+    esac
+
+    echo "$price"
+}
+
+# Function to format task labels with color
+format_task_labels() {
+    local labels="$1"
+    local formatted=""
+
+    IFS=',' read -ra LABEL_ARRAY <<< "$labels"
+    for label in "${LABEL_ARRAY[@]}"; do
+        case "$label" in
+            image) formatted="${formatted}👁️ " ;;
+            coding) formatted="${formatted}💻 " ;;
+            thinking) formatted="${formatted}🧠 " ;;
+            longContext) formatted="${formatted}📚 " ;;
+            background) formatted="${formatted}⚡ " ;;
+            default) formatted="${formatted}💬 " ;;
+        esac
+    done
+
+    echo "$formatted"
+}
+
+echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════${NC}"
+echo -e "${BOLD}${CYAN}    CCR Smart Configuration${NC}"
+echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════${NC}"
+echo ""
+
+# Discover available models
+echo -e "${YELLOW}Discovering available models...${NC}"
+echo ""
+
+# Get local GGUF models
+echo -e "${GREEN}LOCAL GGUF MODELS (llama.cpp):${NC}"
+echo ""
+printf "  %-45s %s\n" "MODEL" "CAPABILITIES"
+printf "  %-45s %s\n" "-----" "------------"
+
+LOCAL_MODELS=()
+while IFS= read -r line; do
+    if [[ $line =~ ^[[:space:]]+([a-zA-Z0-9_.-]+\.gguf) ]]; then
+        model="${BASH_REMATCH[1]}"
+        LOCAL_MODELS+=("$model")
+        labels=$(get_task_labels "$model")
+        icons=$(format_task_labels "$labels")
+        printf "  %-45s %s\n" "$model" "$icons"
+    elif [[ $line =~ ^[[:space:]]*➤[[:space:]]*([a-zA-Z0-9_.-]+\.gguf) ]]; then
+        model=$(echo "$line" | sed -E 's/.*➤[[:space:]]*([a-zA-Z0-9_.-]+\.gguf).*/\1/')
+        LOCAL_MODELS+=("$model")
+        labels=$(get_task_labels "$model")
+        icons=$(format_task_labels "$labels")
+        printf "  %-45s %s(ACTIVE)\n" "$model" "$icons"
+    fi
+done < <(/root/scripts/llm-list-models 2>/dev/null | grep -E "^\s+\w|^➤")
+
+echo ""
+echo -e "${CYAN}OLLAMA CLOUD MODELS:${NC}"
+
+# First, discover models from ollama.com
+OLLAMA_DISCOVERED=()
+echo -e "${YELLOW}  Discovering from ollama.com...${NC}"
+
+MODEL_FAMILIES=$(curl -s "https://ollama.com/search?c=cloud" 2>/dev/null | \
+  grep -o 'href="/library/[^"]*"' | \
+  sed 's|href="/library/||; s|"||g' | \
+  sort -u)
+
+if [ -z "$MODEL_FAMILIES" ]; then
+  echo "  (Web fetch failed, using cached list)"
+  OLLAMA_DISCOVERED=(
+    "gpt-oss:20b-cloud"
+    "gpt-oss:120b-cloud"
+    "qwen3-coder:480b-cloud"
+    "qwen3-vl:235b-cloud"
+    "qwen3-vl:235b-instruct-cloud"
+    "glm-4.6:cloud"
+    "deepseek-v3.1:671b-cloud"
+    "kimi-k2:1t-cloud"
+    "kimi-k2-thinking:cloud"
+    "minimax-m2:cloud"
+  )
+else
+  # Fetch cloud tags for each family
+  for family in $MODEL_FAMILIES; do
+    CLOUD_TAGS=$(curl -s "https://ollama.com/library/$family/tags" 2>/dev/null | \
+      grep -o "href=\"/library/$family:[^\"]*cloud[^\"]*\"" | \
+      sed "s|href=\"/library/$family:||; s|\"||g" | \
+      sort -u)
+
+    if [ -n "$CLOUD_TAGS" ]; then
+      for tag in $CLOUD_TAGS; do
+        OLLAMA_DISCOVERED+=("$family:$tag")
+      done
+    fi
+  done
+fi
+
+# Get currently pulled models
+PULLED=$(pct exec 100 -- ollama list 2>/dev/null | tail -n +2 | awk '{print $1}')
+
+# Auto-pull missing models (they're tiny - just manifests)
+echo -e "${YELLOW}  Auto-pulling unpulled models...${NC}"
+PULLED_COUNT=0
+for model in "${OLLAMA_DISCOVERED[@]}"; do
+  if ! echo "$PULLED" | grep -q "^${model}$"; then
+    echo "    Pulling $model (manifest, ~400 bytes)..."
+    pct exec 100 -- ollama pull "$model" >/dev/null 2>&1 &
+    ((PULLED_COUNT++))
+  fi
+done
+
+if [ $PULLED_COUNT -gt 0 ]; then
+  echo "  Waiting for $PULLED_COUNT model(s) to register..."
+  wait
+  # Refresh pulled list
+  PULLED=$(pct exec 100 -- ollama list 2>/dev/null | tail -n +2 | awk '{print $1}')
+  echo -e "${GREEN}  ✓ All models registered${NC}"
+fi
+
+echo ""
+printf "  %-45s %s\n" "MODEL" "CAPABILITIES"
+printf "  %-45s %s\n" "-----" "------------"
+
+CLOUD_MODELS=()
+for model in $(printf '%s\n' "${OLLAMA_DISCOVERED[@]}" | sort); do
+  CLOUD_MODELS+=("$model")
+  labels=$(get_task_labels "$model")
+  icons=$(format_task_labels "$labels")
+
+  # Check if pulled
+  if echo "$PULLED" | grep -q "^${model}$"; then
+    status="✅"
+  else
+    status="⏳"
+  fi
+
+  printf "  %-45s %s %s\n" "$model" "$icons" "$status"
+done
+
+echo ""
+echo -e "${CYAN}DASHSCOPE/QWEN CLOUD MODELS:${NC}"
+echo ""
+printf "  %-40s %-15s %s\n" "MODEL" "PRICING" "CAPABILITIES"
+printf "  %-40s %-15s %s\n" "-----" "-------" "------------"
+
+DASHSCOPE_MODELS=()
+# Get key Qwen models (turbo, plus, max, coder, vl) - exclude dated versions for brevity
+while IFS= read -r line; do
+    if [[ $line =~ ^(qwen-(turbo|plus|max|coder-plus|vl-(plus|max))|qwen3-(max|coder-(plus|flash)|vl-(plus|flash)))[[:space:]] ]]; then
+        model=$(echo "$line" | awk '{print $1}')
+        DASHSCOPE_MODELS+=("$model")
+
+        labels=$(get_task_labels "$model")
+        icons=$(format_task_labels "$labels")
+        price=$(get_dashscope_price "$model")
+
+        printf "  %-40s %-15s %s\n" "$model" "$price" "$icons"
+    fi
+done < <(/root/scripts/llm-dashscope-catalog 2>/dev/null | grep -E "^qwen" | grep -v "latest\|2025-\|2024-\|instruct-2507\|thinking-2507\|realtime")
+
+echo ""
+echo -e "${YELLOW}═══════════════════════════════════════════════${NC}"
+echo -e "Total: ${GREEN}${#LOCAL_MODELS[@]}${NC} local, ${CYAN}${#CLOUD_MODELS[@]}${NC} Ollama cloud, ${CYAN}${#DASHSCOPE_MODELS[@]}${NC} DashScope"
+echo ""
+echo -e "${BOLD}Legend:${NC}"
+echo "  💬 default      💻 coding       🧠 thinking"
+echo "  👁️ image        📚 longContext  ⚡ background"
+echo "  ✅ ready        ⏳ pulling"
+echo ""
+
+# Current configuration
+echo -e "${BOLD}${MAGENTA}Current CCR Routing Configuration:${NC}"
+if [ -f "$ROUTES_FILE" ]; then
+    echo ""
+    python3 << 'PYTHON_SCRIPT'
+import json
+import sys
+
+with open("/root/.claude-code-router/routes.json", "r") as f:
+    routes = json.load(f)
+
+tasks = ["default", "background", "coding", "thinking", "longContext", "image"]
+for task in tasks:
+    if task in routes:
+        provider, model = routes[task].split(",", 1)
+        print(f"  {task:15s} → {provider:20s} | {model}")
+PYTHON_SCRIPT
+else
+    echo "  (No configuration found)"
+fi
+
+echo ""
+echo -e "${YELLOW}═══════════════════════════════════════════════${NC}"
+echo -e "${BOLD}Configure Routing${NC}"
+echo ""
+echo "CCR can route different task types to different models:"
+echo "  • default      - General tasks"
+echo "  • background   - Background processing"
+echo "  • coding       - Code generation/editing"
+echo "  • thinking     - Complex reasoning"
+echo "  • longContext  - Tasks with large context"
+echo "  • image        - Vision/multimodal tasks"
+echo ""
+echo -e "${YELLOW}Options:${NC}"
+echo "  1) Quick setup (use recommended models)"
+echo "  2) Custom setup (choose model for each task)"
+echo "  3) View current config and exit"
+echo "  4) Exit without changes"
+echo ""
+echo -e "${CYAN}Tip: Press CTRL+D to exit anytime${NC}"
+echo ""
+
+read -p "Choose option [1-4, q to quit]: " option
+
+# Handle various exit inputs
+if [[ "$option" == "q" ]] || [[ "$option" == "Q" ]] || [[ "$option" == "exit" ]] || [[ -z "$option" ]]; then
+    echo ""
+    echo "Exiting without changes"
+    exit 0
+fi
+
+case $option in
+    1)
+        echo ""
+        echo -e "${GREEN}Applying recommended configuration...${NC}"
+
+        # Recommended setup - prefer DashScope for cloud tasks
+        cat > "$ROUTES_FILE" << 'EOF'
+{
+  "default": "dashscope,qwen-plus",
+  "background": "llamacpp-local,gpt-oss-20b-GGUF-q5_k_m",
+  "coding": "dashscope,qwen3-coder-plus",
+  "thinking": "ollama-local,deepseek-v3.1:671b-cloud",
+  "longContext": "dashscope,qwen3-coder-plus",
+  "longContextThreshold": 60000,
+  "image": "dashscope,qwen3-vl-plus",
+  "description": "Routing rules for different task types - modify via ccr-smart-config script"
+}
+EOF
+
+        echo -e "${GREEN}✓ Recommended configuration applied${NC}"
+        echo ""
+        echo "Configuration:"
+        echo "  Default: qwen-plus (balanced DashScope model)"
+        echo "  Background: gpt-oss-20b (fast local model)"
+        echo "  Coding: qwen3-coder-plus (advanced coding)"
+        echo "  Thinking: deepseek-v3.1:671b-cloud (best reasoning)"
+        echo "  Long Context: qwen3-coder-plus (large context)"
+        echo "  Image: qwen3-vl-plus (advanced vision)"
+
+        # Regenerate and restart
+        echo ""
+        echo -e "${YELLOW}Regenerating CCR configuration...${NC}"
+        /root/scripts/ccr-regenerate-config.sh
+
+        echo ""
+        echo -e "${YELLOW}Restarting CCR service...${NC}"
+        ccr restart
+        sleep 2
+
+        echo -e "${GREEN}✓ CCR restarted successfully${NC}"
+        ;;
+
+    2)
+        echo ""
+        echo -e "${YELLOW}Custom configuration not yet implemented${NC}"
+        echo "For now, edit manually: $ROUTES_FILE"
+        echo "Then run: ccr-regenerate-config.sh && ccr restart"
+        exit 0
+        ;;
+
+    3)
+        echo ""
+        echo -e "${GREEN}Current configuration displayed above${NC}"
+        exit 0
+        ;;
+
+    4)
+        echo ""
+        echo "Exiting without changes"
+        exit 0
+        ;;
+
+    *)
+        echo -e "${RED}Invalid option${NC}"
+        exit 1
+        ;;
+esac
+
+echo ""
+echo -e "${GREEN}${BOLD}Configuration complete!${NC}"
+echo ""
+echo "Test your setup:"
+echo "  ccr code"
+echo ""
+echo "To reconfigure later:"
+echo "  ccr-smart-config"
+echo ""
