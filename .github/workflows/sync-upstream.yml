@@ -1,1 +1,160 @@
+name: Sync with Upstream
 
+on:
+  # Run every day at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Allow manual trigger from Actions tab
+  workflow_dispatch:
+
+  # Run when changes are pushed to main (to test the workflow)
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/sync-upstream.yml'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for proper merging
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/musistudio/claude-code-router.git || true
+          git remote -v
+
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream
+          echo "✓ Fetched from upstream"
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          # Compare local main with upstream main
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+
+          echo "Local commit: $LOCAL"
+          echo "Upstream commit: $UPSTREAM"
+
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No new changes from upstream"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "✓ New changes detected from upstream"
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          # Try to merge upstream changes
+          if git merge upstream/main --no-edit; then
+            echo "✓ Successfully merged upstream changes"
+          else
+            echo "⚠️ Merge conflict detected"
+            echo "conflict=true" >> $GITHUB_ENV
+
+            # Show conflicted files
+            echo "Conflicted files:"
+            git diff --name-only --diff-filter=U
+
+            # Abort the merge
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Push changes to fork
+        if: steps.check.outputs.has_changes == 'true' && env.conflict != 'true'
+        run: |
+          git push origin main
+          echo "✓ Pushed updates to fork"
+
+      - name: Create issue on conflict
+        if: failure() && env.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '🔄 Upstream Sync Conflict Detected';
+            const body = `## Merge Conflict Detected
+
+            The automated sync with upstream \`musistudio/claude-code-router\` has encountered merge conflicts.
+
+            ### Action Required
+            Manual intervention is needed to resolve conflicts and complete the sync.
+
+            ### Steps to Resolve
+            1. Clone the repository locally
+            2. Run the following commands:
+               \`\`\`bash
+               cd /root/repos/claude-code-router
+               git fetch upstream
+               git merge upstream/main
+               # Resolve conflicts manually
+               git commit
+               git push origin main
+               \`\`\`
+
+            ### Conflicted Files
+            Check the workflow logs for details on which files have conflicts.
+
+            ### Workflow Run
+            [View Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ---
+            *This issue was automatically created by the sync-upstream workflow.*`;
+
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['sync-conflict']
+            });
+
+            if (issues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['sync-conflict', 'automation']
+              });
+            }
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check.outputs.has_changes }}" = "true" ]; then
+            if [ "${{ env.conflict }}" = "true" ]; then
+              echo "❌ **Status:** Merge conflict detected" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **Action Required:** Manual conflict resolution needed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ **Status:** Successfully synced with upstream" >> $GITHUB_STEP_SUMMARY
+              echo "📦 **Changes:** Merged and pushed to fork" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ **Status:** Already up to date" >> $GITHUB_STEP_SUMMARY
+            echo "📦 **Changes:** None" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Upstream:** musistudio/claude-code-router" >> $GITHUB_STEP_SUMMARY
+          echo "**Fork:** MichaelNewham/claude-code-router" >> $GITHUB_STEP_SUMMARY
